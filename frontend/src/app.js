@@ -3,7 +3,17 @@ import VideoBackground from './components/VideoBackground';
 import Header from './components/Header';
 import Chatbot from './components/Chatbot';
 
+const ADMIN_USERNAME = process.env.REACT_APP_ADMIN_USER || 'admin';
+const ADMIN_PASSWORD = process.env.REACT_APP_ADMIN_PASS || 'UniShield@2026';
+
 function App() {
+    const [isAuthenticated, setIsAuthenticated] = useState(
+        () => sessionStorage.getItem('unishield_admin_auth') === 'true'
+    );
+    const [loginUser, setLoginUser] = useState('');
+    const [loginPass, setLoginPass] = useState('');
+    const [loginError, setLoginError] = useState('');
+
     const [activeTab, setActiveTab] = useState('overview');
     const [theme, setTheme] = useState('light'); // 'light', 'night', 'neon'
     const [vulnerabilities, setVulnerabilities] = useState([]);
@@ -15,8 +25,29 @@ function App() {
     const [kevOnly, setKevOnly] = useState(false);
     const [selectedVuln, setSelectedVuln] = useState(null);
 
+    const handleAdminLogin = (e) => {
+        e.preventDefault();
+        if (loginUser.trim() === ADMIN_USERNAME && loginPass === ADMIN_PASSWORD) {
+            sessionStorage.setItem('unishield_admin_auth', 'true');
+            setIsAuthenticated(true);
+            setLoginError('');
+            setLoginPass('');
+        } else {
+            setLoginError('Invalid admin username or password.');
+        }
+    };
+
+    const handleAdminLogout = () => {
+        sessionStorage.removeItem('unishield_admin_auth');
+        setIsAuthenticated(false);
+        setLoginUser('');
+        setLoginPass('');
+    };
+
     // Fetching Live Vulnerabilities from Backend
     useEffect(() => {
+        if (!isAuthenticated) return;
+
         fetch('http://localhost:5001/api/vulnerabilities')
             .then(res => res.json())
             .then(data => {
@@ -26,10 +57,12 @@ function App() {
                 }
             })
             .catch(err => console.error("Error fetching vulnerabilities:", err));
-    }, []);
+    }, [isAuthenticated]);
 
     // Fetching Live Traffic & Attack Logs from Neon DB via Backend
     useEffect(() => {
+        if (!isAuthenticated) return;
+
         const fetchLogs = () => {
             fetch('http://localhost:5001/api/logs')
                 .then(res => res.json())
@@ -44,7 +77,7 @@ function App() {
         fetchLogs();
         const interval = setInterval(fetchLogs, 5000);
         return () => clearInterval(interval);
-    }, []);
+    }, [isAuthenticated]);
 
     // Helper to safely extract software name regardless of backend column name
     const getSoftwareName = (v) => v.software_name || v.software || v.product || 'Web Stack';
@@ -70,6 +103,65 @@ function App() {
         return 'text-gray-900 selection:bg-[#6b1d1d] selection:text-white';
     };
 
+    if (!isAuthenticated) {
+        return (
+            <div className="min-h-screen bg-[#0b0d12] text-white flex items-center justify-center p-6 font-sans">
+                <div className="w-full max-w-md bg-black/70 border border-white/20 rounded-lg p-8 shadow-2xl">
+                    <div className="mb-6 border-b border-white/10 pb-4">
+                        <p className="text-xs font-mono uppercase tracking-widest text-red-400">UNISHIELD SECURITY GATE</p>
+                        <h1 className="text-2xl font-black mt-1">ADMIN LOGIN REQUIRED</h1>
+                        <p className="text-xs text-white/60 mt-1">
+                            Authorized personnel only. Enter admin credentials to access monitoring and IP firewall controls.
+                        </p>
+                    </div>
+
+                    <form onSubmit={handleAdminLogin} className="space-y-4">
+                        <div>
+                            <label className="block text-xs font-bold uppercase tracking-wider text-white/70 mb-1.5">
+                                Admin Username
+                            </label>
+                            <input
+                                type="text"
+                                value={loginUser}
+                                onChange={(e) => setLoginUser(e.target.value)}
+                                placeholder="Enter admin username"
+                                required
+                                className="w-full bg-black/60 border border-white/25 rounded px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-red-500"
+                            />
+                        </div>
+
+                        <div>
+                            <label className="block text-xs font-bold uppercase tracking-wider text-white/70 mb-1.5">
+                                Password
+                            </label>
+                            <input
+                                type="password"
+                                value={loginPass}
+                                onChange={(e) => setLoginPass(e.target.value)}
+                                placeholder="Enter admin password"
+                                required
+                                className="w-full bg-black/60 border border-white/25 rounded px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-red-500"
+                            />
+                        </div>
+
+                        {loginError && (
+                            <div className="text-xs font-mono text-red-400 bg-red-950/40 border border-red-500/40 rounded p-2.5">
+                                {loginError}
+                            </div>
+                        )}
+
+                        <button
+                            type="submit"
+                            className="w-full bg-[#6b1d1d] hover:bg-[#521616] text-white font-bold text-sm tracking-wider py-3 rounded transition-all"
+                        >
+                            UNLOCK UNISHIELD DASHBOARD
+                        </button>
+                    </form>
+                </div>
+            </div>
+        );
+    }
+
     return (
         <div className={`relative min-h-screen font-sans ${getThemeTextClasses()}`}>
             {/* Background Video Layer with Theme Support */}
@@ -84,7 +176,16 @@ function App() {
                     setTheme={setTheme}
                 />
 
-                <main className="p-8 max-w-7xl mx-auto">
+                <div className="max-w-7xl mx-auto px-8 pt-4 flex justify-end">
+                    <button
+                        onClick={handleAdminLogout}
+                        className="px-3.5 py-1.5 text-xs font-mono font-bold uppercase tracking-wider bg-black/60 hover:bg-red-700 text-white border border-white/25 rounded transition-all"
+                    >
+                        LOCK / LOGOUT
+                    </button>
+                </div>
+
+                <main className="p-8 pt-4 max-w-7xl mx-auto">
                     {/* TAB 1: OVERVIEW */}
                     {activeTab === 'overview' && (
                         <div className="space-y-12">
