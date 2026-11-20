@@ -23,23 +23,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 
-@app.before_request
-def restore_vercel_original_path():
-    # Vercel rewrite "/(.*)" -> "/server.py" sets PATH_INFO to "/server.py"
-    if request.environ.get("PATH_INFO") == "/server.py":
-        orig_uri = (
-            request.headers.get("x-vercel-original-url")
-            or request.headers.get("x-invoke-path")
-            or request.environ.get("REQUEST_URI")
-            or "/"
-        )
-        orig_path = orig_uri.split("?")[0]
-        if orig_path and orig_path != "/server.py":
-            request.environ["PATH_INFO"] = orig_path
-
-
 @app.route("/", methods=["GET"])
-@app.route("/server.py", methods=["GET"])
 @app.route("/api/health", methods=["GET"])
 def health_check():
     return jsonify({
@@ -88,6 +72,34 @@ def get_logs():
         return jsonify(attacks), 200
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+class VercelPathFixMiddleware:
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        path_info = environ.get("PATH_INFO", "")
+        if path_info in ("", "/server.py"):
+            candidates = [
+                environ.get("HTTP_X_VERCEL_ORIGINAL_URL", ""),
+                environ.get("HTTP_X_MATCHED_PATH", ""),
+                environ.get("HTTP_X_INVOKE_PATH", ""),
+                environ.get("REQUEST_URI", ""),
+            ]
+            for raw in candidates:
+                if raw:
+                    clean_path = raw.split("?")[0]
+                    if clean_path and clean_path != "/server.py":
+                        environ["PATH_INFO"] = clean_path
+                        break
+            else:
+                if path_info == "/server.py":
+                    environ["PATH_INFO"] = "/"
+        return self.wsgi_app(environ, start_response)
+
+
+app.wsgi_app = VercelPathFixMiddleware(app.wsgi_app)
 
 
 if __name__ == "__main__":
