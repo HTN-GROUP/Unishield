@@ -3,6 +3,7 @@ import VideoBackground from './components/VideoBackground';
 import Header from './components/Header';
 import Chatbot from './components/Chatbot';
 
+const API_BASE = process.env.REACT_APP_API_URL || 'https://unishield-backend.vercel.app';
 const ADMIN_USERNAME = process.env.REACT_APP_ADMIN_USER || 'admin';
 const ADMIN_PASSWORD = process.env.REACT_APP_ADMIN_PASS || 'UniShield@2026';
 
@@ -48,7 +49,7 @@ function App() {
     useEffect(() => {
         if (!isAuthenticated) return;
 
-        fetch('http://localhost:5001/api/vulnerabilities')
+        fetch(`${API_BASE}/?endpoint=vulnerabilities`)
             .then(res => res.json())
             .then(data => {
                 if (Array.isArray(data)) {
@@ -59,12 +60,12 @@ function App() {
             .catch(err => console.error("Error fetching vulnerabilities:", err));
     }, [isAuthenticated]);
 
-    // Fetching Live Traffic & Attack Logs from Neon DB via Backend
+    // Fetching Live Traffic & Attack Logs from Backend
     useEffect(() => {
         if (!isAuthenticated) return;
 
         const fetchLogs = () => {
-            fetch('http://localhost:5001/api/logs')
+            fetch(`${API_BASE}/?endpoint=logs`)
                 .then(res => res.json())
                 .then(data => {
                     if (Array.isArray(data)) {

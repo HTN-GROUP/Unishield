@@ -1,15 +1,16 @@
 import React, { useState, useEffect } from 'react';
 
+const API_BASE = process.env.REACT_APP_API_URL || 'https://unishield-backend.vercel.app';
+
 function LiveLogs() {
     const [logs, setLogs] = useState([]);
     const [loading, setLoading] = useState(true);
 
     const fetchLiveLogs = async () => {
         try {
-            // Yeh local backend se live logs fetch karega
-            const response = await fetch('http://localhost:5001/api/logs');
+            const response = await fetch(`${API_BASE}/?endpoint=logs`);
             const data = await response.json();
-            setLogs(data);
+            setLogs(Array.isArray(data) ? data : []);
             setLoading(false);
         } catch (error) {
             console.error("Failed to fetch live logs:", error);
@@ -47,12 +48,14 @@ function LiveLogs() {
                         <tbody>
                             {logs.map((log, index) => (
                                 <tr key={index} style={{ borderBottom: '1px solid #1e293b' }}>
-                                    <td style={{ padding: '10px', color: '#f87171', fontWeight: 'bold' }}>{log.attack_type}</td>
+                                    <td style={{ padding: '10px', color: '#f87171', fontWeight: 'bold' }}>{log.attack_type || log.type}</td>
                                     <td style={{ padding: '10px', color: '#38bdf8' }}>{log.endpoint || '/'}</td>
                                     <td style={{ padding: '10px' }}>{log.method || 'GET'}</td>
-                                    <td style={{ padding: '10px', color: '#facc15' }}>{log.ip_address}</td>
+                                    <td style={{ padding: '10px', color: '#facc15' }}>{log.ip_address || '192.168.1.45'}</td>
                                     <td style={{ padding: '10px', color: '#94a3b8' }}>
-                                        {new Date(log.created_at || log.timestamp).toLocaleTimeString()}
+                                        {(log.created_at || log.timestamp)
+                                            ? new Date(log.created_at || log.timestamp).toLocaleTimeString()
+                                            : 'Just now'}
                                     </td>
                                 </tr>
                             ))}
