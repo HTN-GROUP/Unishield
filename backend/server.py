@@ -3,7 +3,6 @@ import sys
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-# Ensure backend directory is in sys.path on Vercel
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
@@ -23,18 +22,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 
-@app.route("/", methods=["GET"])
-@app.route("/api/health", methods=["GET"])
-def health_check():
-    return jsonify({
-        "status": "ok" if ETL_IMPORT_ERROR is None else "degraded",
-        "service": "UniShield Backend",
-        "etl_import_error": ETL_IMPORT_ERROR,
-    }), 200
-
-
-@app.route("/api/vulnerabilities", methods=["GET"])
-def get_vulnerabilities():
+def _vulnerabilities_response():
     if ETL_IMPORT_ERROR:
         return jsonify({"error": ETL_IMPORT_ERROR}), 500
     try:
@@ -47,8 +35,7 @@ def get_vulnerabilities():
         return jsonify({"error": str(exc)}), 500
 
 
-@app.route("/api/logs", methods=["GET"])
-def get_logs():
+def _logs_response():
     if ETL_IMPORT_ERROR:
         return jsonify({"error": ETL_IMPORT_ERROR}), 500
     try:
@@ -74,6 +61,32 @@ def get_logs():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/", methods=["GET"])
+@app.route("/server.py", methods=["GET"])
+@app.route("/api/health", methods=["GET"])
+def health_check():
+    endpoint = request.args.get("endpoint", "").lower()
+    if endpoint == "logs":
+        return _logs_response()
+    if endpoint == "vulnerabilities":
+        return _vulnerabilities_response()
+    return jsonify({
+        "status": "ok" if ETL_IMPORT_ERROR is None else "degraded",
+        "service": "UniShield Backend",
+        "etl_import_error": ETL_IMPORT_ERROR,
+    }), 200
+
+
+@app.route("/api/vulnerabilities", methods=["GET"])
+def get_vulnerabilities():
+    return _vulnerabilities_response()
+
+
+@app.route("/api/logs", methods=["GET"])
+def get_logs():
+    return _logs_response()
+
+
 class VercelPathFixMiddleware:
     def __init__(self, wsgi_app):
         self.wsgi_app = wsgi_app
@@ -81,21 +94,21 @@ class VercelPathFixMiddleware:
     def __call__(self, environ, start_response):
         path_info = environ.get("PATH_INFO", "")
         if path_info in ("", "/server.py"):
-            candidates = [
-                environ.get("HTTP_X_VERCEL_ORIGINAL_URL", ""),
-                environ.get("HTTP_X_MATCHED_PATH", ""),
-                environ.get("HTTP_X_INVOKE_PATH", ""),
-                environ.get("REQUEST_URI", ""),
-            ]
-            for raw in candidates:
-                if raw:
-                    clean_path = raw.split("?")[0]
-                    if clean_path and clean_path != "/server.py":
-                        environ["PATH_INFO"] = clean_path
+            for key in (
+                "HTTP_X_VERCEL_ORIGINAL_URL",
+                "HTTP_X_MATCHED_PATH",
+                "HTTP_X_INVOKE_PATH",
+                "HTTP_X_REWRITE_URL",
+                "REQUEST_URI",
+            ):
+                val = environ.get(key, "")
+                if val:
+                    clean = val.split("?")[0]
+                    if clean and clean != "/server.py":
+                        environ["PATH_INFO"] = clean
                         break
             else:
-                if path_info == "/server.py":
-                    environ["PATH_INFO"] = "/"
+                environ["PATH_INFO"] = "/"
         return self.wsgi_app(environ, start_response)
 
 
