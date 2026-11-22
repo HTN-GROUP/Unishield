@@ -413,6 +413,86 @@ def _blocked_ips_list():
         return jsonify({"error": str(exc)}), 500
 
 
+def _chat_response():
+    payload = request.get_json(silent=True) or {}
+    user_msg = str(
+        payload.get("message")
+        or payload.get("query")
+        or payload.get("prompt")
+        or payload.get("text")
+        or request.args.get("message")
+        or ""
+    ).strip()
+
+    if not user_msg:
+        return jsonify({
+            "reply": "Please ask a question about CVEs, CISA KEV vulnerabilities, SQL injection, XSS, path traversal, or blocking IPs."
+        }), 200
+
+    lower = user_msg.lower()
+
+    db_stats_note = ""
+    try:
+        db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+        if db_url and PG_AVAILABLE:
+            ensure_logs_table()
+            ensure_blocked_ips_table()
+            log_cnt_rows = run_query("SELECT COUNT(*) FROM live_logs")
+            blk_cnt_rows = run_query("SELECT COUNT(*) FROM blocked_ips")
+            total_logs = int(log_cnt_rows[0][0]) if log_cnt_rows else 0
+            total_blocked = int(blk_cnt_rows[0][0]) if blk_cnt_rows else 0
+            db_stats_note = f" (Current DB: {total_logs} live logs, {total_blocked} blocked IPs)"
+    except Exception:
+        db_stats_note = ""
+
+    if any(g in lower for g in ("aoa", "assalam", "hello", "hi", "hey", "salam")):
+        reply = (
+            f"Walaikum Assalam! I am the UniShield AI Security Assistant{db_stats_note}. "
+            "Ask me about critical vulnerabilities, CISA KEV items, SQL injection, XSS, path traversal, or IP blocking."
+        )
+    elif "kev" in lower or "exploited" in lower:
+        reply = (
+            "CISA KEV (Known Exploited Vulnerabilities) lists CVEs with confirmed active exploitation. "
+            "Prioritize patching KEV items first, especially public-facing web apps, servers, and plugins."
+        )
+    elif "sql" in lower or "sqli" in lower:
+        reply = (
+            "SQL Injection happens when untrusted input reaches SQL queries without proper parameterization. "
+            "Always use parameterized queries/prepared statements, validate input types, and block repeat attacker IPs."
+        )
+    elif "xss" in lower or "script" in lower:
+        reply = (
+            "Cross-Site Scripting (XSS) runs untrusted scripts in a victim's browser. "
+            "Use context-aware output encoding, sanitize HTML inputs, and enforce a Content Security Policy (CSP)."
+        )
+    elif "path" in lower or "traversal" in lower or "../" in lower:
+        reply = (
+            "Path Traversal attempts to access restricted files outside the web root using sequences like '../'. "
+            "Canonicalize paths, enforce an allow-list/base directory check, and block probing IPs."
+        )
+    elif "block" in lower or "ip" in lower or "firewall" in lower:
+        reply = (
+            f"To block or unblock an IP in UniShield{db_stats_note}, open the Attack Map tab, "
+            "enter the IP in the manual rule box or use the row action button, and refresh to verify persistence."
+        )
+    elif "cve" in lower or "critical" in lower or "patch" in lower or "vulnerability" in lower:
+        reply = (
+            "Prioritize CVEs by combining CVSS score, CISA KEV exploitation status, and exposure on internet-facing assets. "
+            "Review the Fix First and CVE Explorer tabs for prioritized items."
+        )
+    else:
+        reply = (
+            f"UniShield SOC Assistant{db_stats_note}: For '{user_msg}', monitor real-time traffic in Attack Map, "
+            "filter attack types (SQL_INJECTION, XSS_ATTACK, PATH_TRAVERSAL, BRUTE_FORCE_PROBE), and block repeat offenders."
+        )
+
+    return jsonify({
+        "reply": reply,
+        "response": reply,
+        "message": reply,
+    }), 200
+
+
 @app.route("/", methods=["GET", "POST", "DELETE", "OPTIONS"])
 @app.route("/server.py", methods=["GET", "POST", "DELETE", "OPTIONS"])
 @app.route("/api/health", methods=["GET"])
@@ -422,6 +502,8 @@ def health_check():
 
     endpoint = (request.args.get("endpoint") or "").strip().lower()
 
+    if endpoint == "chat":
+        return _chat_response()
     if endpoint == "block_ip":
         return _block_ip_action()
     if endpoint == "unblock_ip":
@@ -444,6 +526,12 @@ def health_check():
         "db_driver_ready": PG_AVAILABLE,
         "db_url_configured": bool(os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")),
     }), 200
+
+
+@app.route("/api/chat", methods=["POST", "GET"])
+@app.route("/chat", methods=["POST", "GET"])
+def api_chat():
+    return _chat_response()
 
 
 @app.route("/api/track", methods=["POST", "GET"])
