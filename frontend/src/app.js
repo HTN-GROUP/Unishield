@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import VideoBackground from './components/VideoBackground';
 import Header from './components/Header';
 import Chatbot from './components/Chatbot';
@@ -6,6 +6,7 @@ import Chatbot from './components/Chatbot';
 const API_BASE = process.env.REACT_APP_API_URL || 'https://unishield-backend.vercel.app';
 const ADMIN_USERNAME = process.env.REACT_APP_ADMIN_USER || 'admin';
 const ADMIN_PASSWORD = process.env.REACT_APP_ADMIN_PASS || 'UniShield@2026';
+const LOG_LIMIT = 1000;
 
 function App() {
     const [isAuthenticated, setIsAuthenticated] = useState(
@@ -20,7 +21,14 @@ function App() {
     const [vulnerabilities, setVulnerabilities] = useState([]);
     const [liveLogs, setLiveLogs] = useState([]);
     const [blockedIps, setBlockedIps] = useState([]);
-    const [logFilter, setLogFilter] = useState('ALL'); // 'ALL', 'ATTACKS', 'NORMAL'
+    const [busyIp, setBusyIp] = useState('');
+    const [clearingLogs, setClearingLogs] = useState(false);
+    const [clearPeriod, setClearPeriod] = useState('1'); // '1', '7', 'ALL'
+    const [socNotice, setSocNotice] = useState('');
+
+    const [logFilter, setLogFilter] = useState('ALL'); // 'ALL', 'ATTACKS', 'NORMAL', 'BLOCKED'
+    const [attackTypeFilter, setAttackTypeFilter] = useState('ALL');
+    const [logSearch, setLogSearch] = useState('');
     const [searchQuery, setSearchQuery] = useState('');
     const [severityFilter, setSeverityFilter] = useState('ALL');
     const [kevOnly, setKevOnly] = useState(false);
@@ -60,25 +68,119 @@ function App() {
             .catch(err => console.error("Error fetching vulnerabilities:", err));
     }, [isAuthenticated]);
 
-    // Fetching Live Traffic & Attack Logs from Backend
+    const fetchLogsAndBlocked = useCallback(async () => {
+        try {
+            const [logsRes, blockedRes] = await Promise.all([
+                fetch(`${API_BASE}/?endpoint=logs&limit=${LOG_LIMIT}`),
+                fetch(`${API_BASE}/?endpoint=blocked_ips`).catch(() => null),
+            ]);
+            const logsData = await logsRes.json();
+            const parsedLogs = Array.isArray(logsData) ? logsData : [];
+            setLiveLogs(parsedLogs);
+
+            if (blockedRes && blockedRes.ok) {
+                const blockedData = await blockedRes.json();
+                if (Array.isArray(blockedData)) {
+                    setBlockedIps(blockedData.map(item => item.ip_address).filter(Boolean));
+                }
+            } else {
+                const fromLogs = parsedLogs.filter(item => item.blocked).map(item => item.ip_address);
+                setBlockedIps(prev => [...new Set([...prev, ...fromLogs])]);
+            }
+        } catch (err) {
+            console.error("Error fetching live logs:", err);
+        }
+    }, []);
+
+    // Fetching Live Traffic & Attack Logs (up to 1000)
     useEffect(() => {
         if (!isAuthenticated) return;
 
-        const fetchLogs = () => {
-            fetch(`${API_BASE}/?endpoint=logs`)
-                .then(res => res.json())
-                .then(data => {
-                    if (Array.isArray(data)) {
-                        setLiveLogs(data);
-                    }
-                })
-                .catch(err => console.error("Error fetching live logs:", err));
-        };
-
-        fetchLogs();
-        const interval = setInterval(fetchLogs, 5000);
+        fetchLogsAndBlocked();
+        const interval = setInterval(fetchLogsAndBlocked, 5000);
         return () => clearInterval(interval);
-    }, [isAuthenticated]);
+    }, [isAuthenticated, fetchLogsAndBlocked]);
+
+    const blockedSet = useMemo(() => new Set(blockedIps), [blockedIps]);
+
+    const ipHitCounts = useMemo(() => {
+        const map = {};
+        liveLogs.forEach(item => {
+            const ip = (item.ip_address || 'Unknown').trim();
+            map[ip] = (map[ip] || 0) + 1;
+        });
+        return map;
+    }, [liveLogs]);
+
+    const handleToggleBlockIp = async (ipAddress) => {
+        if (!ipAddress || ipAddress === 'Unknown') return;
+        setBusyIp(ipAddress);
+        const isCurrentlyBlocked = blockedSet.has(ipAddress);
+        const endpointName = isCurrentlyBlocked ? 'unblock_ip' : 'block_ip';
+
+        try {
+            const res = await fetch(`${API_BASE}/?endpoint=${endpointName}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ip_address: ipAddress }),
+            });
+            if (res.ok) {
+                setBlockedIps(prev => {
+                    if (isCurrentlyBlocked) {
+                        return prev.filter(ip => ip !== ipAddress);
+                    }
+                    return prev.includes(ipAddress) ? prev : [...prev, ipAddress];
+                });
+                setSocNotice(
+                    isCurrentlyBlocked
+                        ? `IP ${ipAddress} has been unblocked.`
+                        : `IP ${ipAddress} has been added to the blocklist.`
+                );
+                await fetchLogsAndBlocked();
+            }
+        } catch (err) {
+            console.error("Failed to toggle IP block status:", err);
+        } finally {
+            setBusyIp('');
+        }
+    };
+
+    const handleClearOldLogs = async () => {
+        const msg =
+            clearPeriod === 'ALL'
+                ? 'Delete ALL stored logs so fresh logs can be collected cleanly?'
+                : `Delete logs older than ${clearPeriod} day(s)?`;
+        if (!window.confirm(msg)) return;
+
+        setClearingLogs(true);
+        setSocNotice('');
+        try {
+            const payload =
+                clearPeriod === 'ALL'
+                    ? { all: true }
+                    : { all: false, older_than_days: Number(clearPeriod) };
+
+            const res = await fetch(`${API_BASE}/?endpoint=clear_logs`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json();
+            if (res.ok) {
+                setSocNotice(
+                    `Purged ${data.deleted_count ?? 0} old log(s). Active records remaining: ${data.remaining_count ?? 0}.`
+                );
+                await fetchLogsAndBlocked();
+            } else {
+                setSocNotice(data.error || 'Unable to clear logs.');
+            }
+        } catch (err) {
+            console.error("Error clearing logs:", err);
+            setSocNotice('Failed to clear logs.');
+        } finally {
+            setClearingLogs(false);
+        }
+    };
 
     // Helper to safely extract software name regardless of backend column name
     const getSoftwareName = (v) => v.software_name || v.software || v.product || 'Web Stack';
@@ -93,9 +195,59 @@ function App() {
         return matchesSearch && matchesSeverity && matchesKev;
     });
 
+    const isThreatLog = (log) => {
+        const t = (log.attack_type || log.type || 'NORMAL_TRAFFIC').toUpperCase();
+        return !t.includes('NORMAL');
+    };
+
+    const filteredAttackLogs = useMemo(() => {
+        return liveLogs.filter(log => {
+            const typeVal = (log.attack_type || log.type || 'NORMAL_TRAFFIC').toUpperCase();
+            const ipVal = (log.ip_address || '').toLowerCase();
+            const epVal = (log.endpoint || log.log || '/').toLowerCase();
+            const q = logSearch.trim().toLowerCase();
+            const ipIsBlocked = Boolean(log.blocked) || blockedSet.has(log.ip_address);
+
+            if (logFilter === 'ATTACKS' && !isThreatLog(log)) return false;
+            if (logFilter === 'NORMAL' && isThreatLog(log)) return false;
+            if (logFilter === 'BLOCKED' && !ipIsBlocked) return false;
+            if (attackTypeFilter !== 'ALL' && typeVal !== attackTypeFilter) return false;
+            if (q && !ipVal.includes(q) && !epVal.includes(q) && !typeVal.includes(q)) return false;
+            return true;
+        });
+    }, [liveLogs, logFilter, attackTypeFilter, logSearch, blockedSet]);
+
+    const handleExportLogsCsv = () => {
+        const headers = ['ID', 'Type', 'Endpoint', 'IP Address', 'Hits', 'Blocked', 'Timestamp'];
+        const rows = filteredAttackLogs.map(log => {
+            const ip = log.ip_address || 'Unknown';
+            const blockedStatus = Boolean(log.blocked) || blockedSet.has(ip);
+            const ts = log.created_at || log.timestamp || '';
+            return [
+                log.id ?? '',
+                log.attack_type || log.type || 'NORMAL_TRAFFIC',
+                log.endpoint || '/',
+                ip,
+                ipHitCounts[ip] || 1,
+                blockedStatus ? 'BLOCKED' : 'ALLOWED',
+                ts,
+            ]
+                .map(val => `"${String(val).replace(/"/g, '""')}"`)
+                .join(',');
+        });
+
+        const blob = new Blob([[headers.join(','), ...rows].join('\n')], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `unishield-attack-map-${new Date().toISOString().slice(0, 10)}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+    };
+
     const criticalCount = vulnerabilities.filter(v => (v.severity || '').toUpperCase() === 'CRITICAL').length;
     const kevCount = vulnerabilities.filter(v => Boolean(v.is_kev)).length;
-    const attackCount = liveLogs.filter(l => l.attack_type && l.attack_type !== 'NORMAL_TRAFFIC').length;
+    const attackCount = liveLogs.filter(l => isThreatLog(l)).length;
 
     // Theme ke mutabiq dynamic text colors
     const getThemeTextClasses = () => {
@@ -427,43 +579,135 @@ function App() {
 
                     {/* TAB 4: ATTACK MAP */}
                     {activeTab === 'attackMap' && (
-                        <div className="space-y-8">
+                        <div className="space-y-6">
                             <div className="flex flex-wrap justify-between items-end gap-4">
                                 <div>
                                     <h2 className="text-4xl font-black">LIVE WEBSITE ATTACK & TRAFFIC MONITORING</h2>
-                                    <p className="opacity-70 mt-1">Real-time visitor IPs and hacking attempts captured from nexustechautomation.me.</p>
+                                    <p className="opacity-70 mt-1">
+                                        Up to {LOG_LIMIT} real-time records from nexustechautomation.me with persistent IP firewall & log retention.
+                                    </p>
                                 </div>
 
-                                {/* Filter Buttons: Normal vs Attacks */}
-                                <div className="flex space-x-2">
+                                {/* Filter Buttons */}
+                                <div className="flex flex-wrap gap-2">
                                     <button
                                         onClick={() => setLogFilter('ALL')}
-                                        className={`px-4 py-2 text-xs font-bold rounded border transition-all ${logFilter === 'ALL' ? 'bg-[#6b1d1d] text-white border-red-500' : 'bg-black/40 border-white/20 hover:bg-white/10'}`}
+                                        className={`px-3.5 py-2 text-xs font-bold rounded border transition-all ${logFilter === 'ALL' ? 'bg-[#6b1d1d] text-white border-red-500' : 'bg-black/40 border-white/20 text-white hover:bg-white/10'}`}
                                     >
                                         ALL ({liveLogs.length})
                                     </button>
                                     <button
                                         onClick={() => setLogFilter('ATTACKS')}
-                                        className={`px-4 py-2 text-xs font-bold rounded border transition-all ${logFilter === 'ATTACKS' ? 'bg-red-600 text-white border-red-400' : 'bg-black/40 border-white/20 text-red-400 hover:bg-white/10'}`}
+                                        className={`px-3.5 py-2 text-xs font-bold rounded border transition-all ${logFilter === 'ATTACKS' ? 'bg-red-600 text-white border-red-400' : 'bg-black/40 border-white/20 text-red-400 hover:bg-white/10'}`}
                                     >
-                                        HACKING ATTACKS ({attackCount})
+                                        THREATS ({attackCount})
                                     </button>
                                     <button
                                         onClick={() => setLogFilter('NORMAL')}
-                                        className={`px-4 py-2 text-xs font-bold rounded border transition-all ${logFilter === 'NORMAL' ? 'bg-emerald-600 text-white border-emerald-400' : 'bg-black/40 border-white/20 text-emerald-400 hover:bg-white/10'}`}
+                                        className={`px-3.5 py-2 text-xs font-bold rounded border transition-all ${logFilter === 'NORMAL' ? 'bg-emerald-600 text-white border-emerald-400' : 'bg-black/40 border-white/20 text-emerald-400 hover:bg-white/10'}`}
                                     >
-                                        NORMAL VISITS ({liveLogs.length - attackCount})
+                                        NORMAL ({liveLogs.length - attackCount})
+                                    </button>
+                                    <button
+                                        onClick={() => setLogFilter('BLOCKED')}
+                                        className={`px-3.5 py-2 text-xs font-bold rounded border transition-all ${logFilter === 'BLOCKED' ? 'bg-amber-600 text-white border-amber-400' : 'bg-black/40 border-white/20 text-amber-300 hover:bg-white/10'}`}
+                                    >
+                                        BLOCKED ({blockedIps.length})
                                     </button>
                                 </div>
                             </div>
 
+                            {/* Search, Attack Type, Export & Clear Old Data Toolbar */}
+                            <div className="bg-black/45 backdrop-blur-md p-4 border border-white/25 rounded flex flex-wrap items-center justify-between gap-3">
+                                <div className="flex flex-wrap items-center gap-3">
+                                    <input
+                                        type="text"
+                                        placeholder="Search IP or endpoint..."
+                                        value={logSearch}
+                                        onChange={(e) => setLogSearch(e.target.value)}
+                                        className="bg-black/60 border border-white/25 text-white placeholder-white/40 px-3 py-2 text-xs rounded focus:outline-none focus:border-red-500 min-w-[200px]"
+                                    />
+
+                                    <select
+                                        value={attackTypeFilter}
+                                        onChange={(e) => setAttackTypeFilter(e.target.value)}
+                                        className="bg-black/70 border border-white/25 text-white px-3 py-2 text-xs rounded focus:outline-none focus:border-red-500"
+                                    >
+                                        <option value="ALL">All Attack Types</option>
+                                        <option value="SQL_INJECTION">SQL_INJECTION</option>
+                                        <option value="XSS_ATTACK">XSS_ATTACK</option>
+                                        <option value="PATH_TRAVERSAL">PATH_TRAVERSAL</option>
+                                        <option value="BRUTE_FORCE_PROBE">BRUTE_FORCE_PROBE</option>
+                                        <option value="NORMAL_TRAFFIC">NORMAL_TRAFFIC</option>
+                                    </select>
+
+                                    <button
+                                        type="button"
+                                        onClick={handleExportLogsCsv}
+                                        className="px-3 py-2 text-xs font-bold bg-blue-700 hover:bg-blue-600 text-white rounded transition-all"
+                                    >
+                                        EXPORT CSV
+                                    </button>
+                                </div>
+
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <select
+                                        value={clearPeriod}
+                                        onChange={(e) => setClearPeriod(e.target.value)}
+                                        className="bg-black/70 border border-white/25 text-amber-300 px-2.5 py-2 text-xs rounded focus:outline-none"
+                                    >
+                                        <option value="1">Older than 1 Day</option>
+                                        <option value="7">Older than 7 Days</option>
+                                        <option value="ALL">All Logs (Fresh Start)</option>
+                                    </select>
+
+                                    <button
+                                        type="button"
+                                        disabled={clearingLogs}
+                                        onClick={handleClearOldLogs}
+                                        className="px-3.5 py-2 text-xs font-bold bg-red-800 hover:bg-red-700 text-white border border-red-500/50 rounded transition-all"
+                                    >
+                                        {clearingLogs ? 'CLEARING...' : 'CLEAR OLD DATA'}
+                                    </button>
+                                </div>
+                            </div>
+
+                            {socNotice && (
+                                <div className="bg-black/60 border border-cyan-500/40 text-cyan-200 text-xs font-mono px-4 py-2.5 rounded">
+                                    {socNotice}
+                                </div>
+                            )}
+
+                            {/* Blocked IPs Quick Unblock Strip */}
+                            {blockedIps.length > 0 && (
+                                <div className="bg-red-950/35 border border-red-500/40 px-4 py-3 rounded flex flex-wrap items-center gap-2 text-xs">
+                                    <span className="font-mono font-bold text-red-300 uppercase mr-1">Blocked IPs:</span>
+                                    {blockedIps.map((ip) => (
+                                        <span
+                                            key={ip}
+                                            className="inline-flex items-center gap-2 bg-black/60 border border-white/15 px-2.5 py-1 rounded font-mono"
+                                        >
+                                            <span className="text-yellow-300">{ip}</span>
+                                            <button
+                                                type="button"
+                                                disabled={busyIp === ip}
+                                                onClick={() => handleToggleBlockIp(ip)}
+                                                className="px-2 py-0.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded text-[11px]"
+                                            >
+                                                {busyIp === ip ? '...' : 'UNBLOCK'}
+                                            </button>
+                                        </span>
+                                    ))}
+                                </div>
+                            )}
+
                             <div className="bg-black/40 backdrop-blur-md p-6 border border-white/25 shadow-sm rounded">
                                 <h3 className="font-bold text-sm tracking-wider uppercase opacity-80 mb-4 border-b border-white/10 pb-3">
-                                    LIVE TRAFFIC LOGS & IP FIREWALL
+                                    LIVE TRAFFIC LOGS & IP FIREWALL ({filteredAttackLogs.length} SHOWN)
                                 </h3>
 
-                                {liveLogs.length === 0 ? (
-                                    <p className="text-sm opacity-60 py-6 text-center">No live traffic recorded yet. Visit <span className="text-red-400 font-bold">nexustechautomation.me</span> to generate live logs!</p>
+                                {filteredAttackLogs.length === 0 ? (
+                                    <p className="text-sm opacity-60 py-6 text-center">No matching traffic logs found.</p>
                                 ) : (
                                     <div className="overflow-x-auto">
                                         <table className="w-full text-left text-sm">
@@ -472,47 +716,54 @@ function App() {
                                                     <th className="pb-3">STATUS / TYPE</th>
                                                     <th className="pb-3">PAYLOAD / ENDPOINT</th>
                                                     <th className="pb-3">ATTACKER REAL IP</th>
+                                                    <th className="pb-3">HITS</th>
                                                     <th className="pb-3">TIME</th>
                                                     <th className="pb-3">FIREWALL ACTION</th>
                                                 </tr>
                                             </thead>
                                             <tbody className="divide-y divide-white/10">
-                                                {liveLogs
-                                                    .filter(log => {
-                                                        if (logFilter === 'ATTACKS') return log.attack_type && log.attack_type !== 'NORMAL_TRAFFIC';
-                                                        if (logFilter === 'NORMAL') return !log.attack_type || log.attack_type === 'NORMAL_TRAFFIC';
-                                                        return true;
-                                                    })
-                                                    .map((log, idx) => {
-                                                        const isAttack = log.attack_type && log.attack_type !== 'NORMAL_TRAFFIC';
-                                                        const isBlocked = blockedIps.includes(log.ip_address);
-                                                        return (
-                                                            <tr key={idx} className={`transition-colors ${isAttack ? 'bg-red-950/30 hover:bg-red-900/40' : 'hover:bg-white/5'}`}>
-                                                                <td className={`py-3 font-mono font-bold ${isAttack ? 'text-red-400' : 'text-emerald-400'}`}>
-                                                                    {isAttack ? `🚨 ${log.attack_type}` : '✅ NORMAL_VISIT'}
-                                                                </td>
-                                                                <td className="py-3 font-mono text-cyan-300 max-w-xs truncate">{log.endpoint || '/'}</td>
-                                                                <td className="py-3 font-mono font-bold text-yellow-300">{log.ip_address}</td>
-                                                                <td className="py-3 opacity-70 text-xs">
-                                                                    {new Date(log.created_at || log.timestamp).toLocaleTimeString()}
-                                                                </td>
-                                                                <td className="py-3">
-                                                                    {isBlocked ? (
-                                                                        <span className="px-3 py-1 bg-red-600/30 border border-red-500 text-red-300 text-xs font-mono font-bold rounded">
-                                                                            🚫 IP BLOCKED
-                                                                        </span>
-                                                                    ) : (
-                                                                        <button
-                                                                            onClick={() => setBlockedIps([...blockedIps, log.ip_address])}
-                                                                            className={`px-3 py-1 text-xs font-bold rounded transition-all ${isAttack ? 'bg-red-600 hover:bg-red-700 text-white' : 'bg-white/10 hover:bg-white/20 text-white'}`}
-                                                                        >
-                                                                            BLOCK IP
-                                                                        </button>
-                                                                    )}
-                                                                </td>
-                                                            </tr>
-                                                        );
-                                                    })}
+                                                {filteredAttackLogs.map((log, idx) => {
+                                                    const isAttack = isThreatLog(log);
+                                                    const ip = log.ip_address || 'Unknown';
+                                                    const isBlocked = Boolean(log.blocked) || blockedSet.has(ip);
+                                                    const hits = ipHitCounts[ip] || 1;
+                                                    return (
+                                                        <tr key={log.id || idx} className={`transition-colors ${isAttack ? 'bg-red-950/30 hover:bg-red-900/40' : 'hover:bg-white/5'}`}>
+                                                            <td className={`py-3 font-mono font-bold ${isAttack ? 'text-red-400' : 'text-emerald-400'}`}>
+                                                                {isAttack ? `🚨 ${log.attack_type || log.type}` : '✅ NORMAL_VISIT'}
+                                                            </td>
+                                                            <td className="py-3 font-mono text-cyan-300 max-w-xs truncate">{log.endpoint || '/'}</td>
+                                                            <td className="py-3 font-mono font-bold text-yellow-300">{ip}</td>
+                                                            <td className={`py-3 font-mono text-xs ${hits >= 5 ? 'text-red-400 font-bold' : 'opacity-75'}`}>
+                                                                {hits}x
+                                                            </td>
+                                                            <td className="py-3 opacity-70 text-xs">
+                                                                {new Date(log.created_at || log.timestamp).toLocaleTimeString()}
+                                                            </td>
+                                                            <td className="py-3">
+                                                                {isBlocked ? (
+                                                                    <button
+                                                                        type="button"
+                                                                        disabled={busyIp === ip}
+                                                                        onClick={() => handleToggleBlockIp(ip)}
+                                                                        className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-mono font-bold rounded transition-all"
+                                                                    >
+                                                                        {busyIp === ip ? '...' : '🔓 UNBLOCK IP'}
+                                                                    </button>
+                                                                ) : (
+                                                                    <button
+                                                                        type="button"
+                                                                        disabled={busyIp === ip}
+                                                                        onClick={() => handleToggleBlockIp(ip)}
+                                                                        className={`px-3 py-1 text-xs font-bold rounded transition-all ${isAttack ? 'bg-red-600 hover:bg-red-700 text-white' : 'bg-white/10 hover:bg-white/20 text-white'}`}
+                                                                    >
+                                                                        {busyIp === ip ? '...' : 'BLOCK IP'}
+                                                                    </button>
+                                                                )}
+                                                            </td>
+                                                        </tr>
+                                                    );
+                                                })}
                                             </tbody>
                                         </table>
                                     </div>

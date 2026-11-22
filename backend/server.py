@@ -168,19 +168,25 @@ def _vulnerabilities_response():
 
 
 def _logs_response():
+    limit_param = request.args.get("limit", "1000")
+    try:
+        row_limit = max(1, min(int(limit_param), 5000))
+    except ValueError:
+        row_limit = 1000
+
     conn = None
     try:
         conn = get_db_connection()
         if conn:
             ensure_logs_table(conn)
             blocked_set = get_blocked_ip_set(conn)
-            rows = conn.run("""
+            rows = conn.run(f"""
                 SELECT id, ip_address, endpoint, method, attack_type, created_at
                 FROM live_logs
-                ORDER BY created_at DESC
-                LIMIT 50
+                ORDER BY created_at DESC, id DESC
+                LIMIT {row_limit}
             """)
-            if rows:
+            if rows is not None:
                 logs = []
                 for r in rows:
                     ip_val = (r[1] or "Unknown").strip()
@@ -274,10 +280,58 @@ def _logs_response():
     return jsonify(attacks), 200
 
 
+def _clear_logs_action():
+    payload = request.get_json(silent=True) or {}
+    clear_all = bool(payload.get("all", False) or str(request.args.get("all", "")).lower() in ("1", "true", "yes"))
+    older_than_days = payload.get("older_than_days")
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"error": "Database not configured"}), 500
+        ensure_logs_table(conn)
+
+        before_rows = conn.run("SELECT COUNT(*) FROM live_logs")
+        before_count = int(before_rows[0][0]) if before_rows else 0
+
+        if clear_all:
+            conn.run("DELETE FROM live_logs")
+        else:
+            try:
+                days_val = int(older_than_days if older_than_days is not None else request.args.get("days", 1))
+                days_val = max(0, min(days_val, 365))
+            except ValueError:
+                days_val = 1
+
+            if days_val == 0:
+                conn.run("DELETE FROM live_logs")
+            else:
+                conn.run(
+                    "DELETE FROM live_logs WHERE created_at < NOW() - (:d * INTERVAL '1 day')",
+                    d=days_val,
+                )
+
+        after_rows = conn.run("SELECT COUNT(*) FROM live_logs")
+        after_count = int(after_rows[0][0]) if after_rows else 0
+        deleted_count = max(0, before_count - after_count)
+
+        return jsonify({
+            "status": "cleared",
+            "deleted_count": deleted_count,
+            "remaining_count": after_count,
+        }), 200
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
 def _block_ip_action():
     payload = request.get_json(silent=True) or {}
     ip_addr = (payload.get("ip_address") or request.args.get("ip") or "").strip()
-    reason = (payload.get("reason") or "Blocked via UniShield LiveLogs").strip()
+    reason = (payload.get("reason") or "Blocked via UniShield Dashboard").strip()
     if not ip_addr:
         return jsonify({"error": "ip_address is required"}), 400
 
@@ -349,8 +403,8 @@ def _blocked_ips_list():
             conn.close()
 
 
-@app.route("/", methods=["GET", "POST", "OPTIONS"])
-@app.route("/server.py", methods=["GET", "POST", "OPTIONS"])
+@app.route("/", methods=["GET", "POST", "DELETE", "OPTIONS"])
+@app.route("/server.py", methods=["GET", "POST", "DELETE", "OPTIONS"])
 @app.route("/api/health", methods=["GET"])
 def health_check():
     endpoint = request.args.get("endpoint", "").lower()
@@ -358,6 +412,8 @@ def health_check():
         return _track_visit()
     if endpoint == "logs":
         return _logs_response()
+    if endpoint == "clear_logs" or request.method == "DELETE":
+        return _clear_logs_action()
     if endpoint == "vulnerabilities":
         return _vulnerabilities_response()
     if endpoint == "block_ip":
@@ -385,9 +441,16 @@ def get_vulnerabilities():
     return _vulnerabilities_response()
 
 
-@app.route("/api/logs", methods=["GET"])
+@app.route("/api/logs", methods=["GET", "DELETE"])
 def get_logs():
+    if request.method == "DELETE":
+        return _clear_logs_action()
     return _logs_response()
+
+
+@app.route("/api/clear-logs", methods=["POST", "DELETE"])
+def api_clear_logs():
+    return _clear_logs_action()
 
 
 @app.route("/api/block-ip", methods=["POST"])
