@@ -108,7 +108,7 @@ def get_client_ip():
 
 def _track_visit():
     payload = request.get_json(silent=True) or {}
-    ip_addr = payload.get("ip_address") or get_client_ip()
+    ip_addr = (payload.get("ip_address") or get_client_ip()).strip()
     visited_endpoint = payload.get("endpoint") or request.args.get("path") or request.full_path or "/"
     method = payload.get("method") or request.method
     user_agent = payload.get("user_agent") or request.headers.get("User-Agent", "")
@@ -120,7 +120,7 @@ def _track_visit():
         if conn:
             ensure_logs_table(conn)
             blocked_set = get_blocked_ip_set(conn)
-            is_blocked = str(ip_addr).strip() in blocked_set
+            is_blocked = ip_addr in blocked_set
             conn.run(
                 """
                 INSERT INTO live_logs (ip_address, endpoint, method, attack_type, user_agent, created_at)
@@ -133,7 +133,7 @@ def _track_visit():
                 ua=user_agent[:300],
             )
             return jsonify({
-                "status": "recorded",
+                "status": "blocked_recorded" if is_blocked else "recorded",
                 "blocked": is_blocked,
                 "ip_address": ip_addr,
                 "endpoint": visited_endpoint,
@@ -331,7 +331,7 @@ def _clear_logs_action():
 def _block_ip_action():
     payload = request.get_json(silent=True) or {}
     ip_addr = (payload.get("ip_address") or request.args.get("ip") or "").strip()
-    reason = (payload.get("reason") or "Blocked via UniShield Dashboard").strip()
+    reason = (payload.get("reason") or "Blocked via UniShield SOC").strip()
     if not ip_addr:
         return jsonify({"error": "ip_address is required"}), 400
 
@@ -407,21 +407,26 @@ def _blocked_ips_list():
 @app.route("/server.py", methods=["GET", "POST", "DELETE", "OPTIONS"])
 @app.route("/api/health", methods=["GET"])
 def health_check():
-    endpoint = request.args.get("endpoint", "").lower()
-    if endpoint == "track" or request.method == "POST":
-        return _track_visit()
-    if endpoint == "logs":
-        return _logs_response()
-    if endpoint == "clear_logs" or request.method == "DELETE":
-        return _clear_logs_action()
-    if endpoint == "vulnerabilities":
-        return _vulnerabilities_response()
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    endpoint = (request.args.get("endpoint") or "").strip().lower()
+
     if endpoint == "block_ip":
         return _block_ip_action()
     if endpoint == "unblock_ip":
         return _unblock_ip_action()
     if endpoint == "blocked_ips":
         return _blocked_ips_list()
+    if endpoint == "clear_logs" or request.method == "DELETE":
+        return _clear_logs_action()
+    if endpoint == "logs":
+        return _logs_response()
+    if endpoint == "vulnerabilities":
+        return _vulnerabilities_response()
+    if endpoint == "track" or request.method == "POST":
+        return _track_visit()
+
     return jsonify({
         "status": "ok" if ETL_IMPORT_ERROR is None else "degraded",
         "service": "UniShield Backend",
