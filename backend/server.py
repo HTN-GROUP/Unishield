@@ -31,23 +31,57 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 
-def get_db_connection():
+def get_db_connection(prefer_direct_host=False):
     db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
     if not db_url or not PG_AVAILABLE:
         return None
     parsed = urlparse(db_url)
+    host = parsed.hostname
+    if prefer_direct_host and host and "-pooler." in host:
+        host = host.replace("-pooler.", ".", 1)
     return pg8000.native.Connection(
         user=unquote(parsed.username or ""),
         password=unquote(parsed.password or ""),
-        host=parsed.hostname,
+        host=host,
         port=parsed.port or 5432,
         database=(parsed.path or "/neondb").lstrip("/"),
         ssl_context=True,
     )
 
 
-def ensure_logs_table(conn):
-    conn.run("""
+def run_query(sql, **params):
+    last_exc = None
+    for attempt in range(3):
+        conn = None
+        try:
+            conn = get_db_connection(prefer_direct_host=(attempt >= 1))
+            if not conn:
+                raise RuntimeError("Database not configured")
+            if params:
+                return conn.run(sql, **params)
+            return conn.run(sql)
+        except Exception as exc:
+            last_exc = exc
+            err_msg = str(exc).lower()
+            if attempt < 2 and (
+                "26000" in err_msg
+                or "prepared statement" in err_msg
+                or "closed" in err_msg
+                or "connection" in err_msg
+            ):
+                continue
+            raise
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    raise last_exc
+
+
+def ensure_logs_table():
+    run_query("""
         CREATE TABLE IF NOT EXISTS live_logs (
             id SERIAL PRIMARY KEY,
             ip_address VARCHAR(100),
@@ -58,7 +92,7 @@ def ensure_logs_table(conn):
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
-    conn.run("""
+    run_query("""
         ALTER TABLE live_logs
         ADD COLUMN IF NOT EXISTS user_agent TEXT,
         ADD COLUMN IF NOT EXISTS method VARCHAR(20),
@@ -67,8 +101,8 @@ def ensure_logs_table(conn):
     """)
 
 
-def ensure_blocked_ips_table(conn):
-    conn.run("""
+def ensure_blocked_ips_table():
+    run_query("""
         CREATE TABLE IF NOT EXISTS blocked_ips (
             ip_address VARCHAR(100) PRIMARY KEY,
             reason TEXT,
@@ -77,10 +111,10 @@ def ensure_blocked_ips_table(conn):
     """)
 
 
-def get_blocked_ip_set(conn):
+def get_blocked_ip_set():
     try:
-        ensure_blocked_ips_table(conn)
-        rows = conn.run("SELECT ip_address FROM blocked_ips")
+        ensure_blocked_ips_table()
+        rows = run_query("SELECT ip_address FROM blocked_ips")
         return {str(r[0]).strip() for r in rows if r and r[0]}
     except Exception:
         return set()
@@ -114,14 +148,13 @@ def _track_visit():
     user_agent = payload.get("user_agent") or request.headers.get("User-Agent", "")
     attack_type = payload.get("attack_type") or detect_attack_type(visited_endpoint)
 
-    conn = None
     try:
-        conn = get_db_connection()
-        if conn:
-            ensure_logs_table(conn)
-            blocked_set = get_blocked_ip_set(conn)
+        db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+        if db_url and PG_AVAILABLE:
+            ensure_logs_table()
+            blocked_set = get_blocked_ip_set()
             is_blocked = ip_addr in blocked_set
-            conn.run(
+            run_query(
                 """
                 INSERT INTO live_logs (ip_address, endpoint, method, attack_type, user_agent, created_at)
                 VALUES (:ip, :ep, :m, :at, :ua, NOW())
@@ -149,9 +182,6 @@ def _track_visit():
         }), 200
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
-    finally:
-        if conn:
-            conn.close()
 
 
 def _vulnerabilities_response():
@@ -174,13 +204,12 @@ def _logs_response():
     except ValueError:
         row_limit = 1000
 
-    conn = None
     try:
-        conn = get_db_connection()
-        if conn:
-            ensure_logs_table(conn)
-            blocked_set = get_blocked_ip_set(conn)
-            rows = conn.run(f"""
+        db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+        if db_url and PG_AVAILABLE:
+            ensure_logs_table()
+            blocked_set = get_blocked_ip_set()
+            rows = run_query(f"""
                 SELECT id, ip_address, endpoint, method, attack_type, created_at
                 FROM live_logs
                 ORDER BY created_at DESC, id DESC
@@ -205,9 +234,6 @@ def _logs_response():
                 return jsonify(logs), 200
     except Exception:
         pass
-    finally:
-        if conn:
-            conn.close()
 
     if ETL_IMPORT_ERROR:
         return jsonify({"error": ETL_IMPORT_ERROR}), 500
@@ -285,18 +311,17 @@ def _clear_logs_action():
     clear_all = bool(payload.get("all", False) or str(request.args.get("all", "")).lower() in ("1", "true", "yes"))
     older_than_days = payload.get("older_than_days")
 
-    conn = None
     try:
-        conn = get_db_connection()
-        if not conn:
+        db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+        if not db_url or not PG_AVAILABLE:
             return jsonify({"error": "Database not configured"}), 500
-        ensure_logs_table(conn)
+        ensure_logs_table()
 
-        before_rows = conn.run("SELECT COUNT(*) FROM live_logs")
+        before_rows = run_query("SELECT COUNT(*) FROM live_logs")
         before_count = int(before_rows[0][0]) if before_rows else 0
 
         if clear_all:
-            conn.run("DELETE FROM live_logs")
+            run_query("DELETE FROM live_logs")
         else:
             try:
                 days_val = int(older_than_days if older_than_days is not None else request.args.get("days", 1))
@@ -305,14 +330,14 @@ def _clear_logs_action():
                 days_val = 1
 
             if days_val == 0:
-                conn.run("DELETE FROM live_logs")
+                run_query("DELETE FROM live_logs")
             else:
-                conn.run(
+                run_query(
                     "DELETE FROM live_logs WHERE created_at < NOW() - (:d * INTERVAL '1 day')",
                     d=days_val,
                 )
 
-        after_rows = conn.run("SELECT COUNT(*) FROM live_logs")
+        after_rows = run_query("SELECT COUNT(*) FROM live_logs")
         after_count = int(after_rows[0][0]) if after_rows else 0
         deleted_count = max(0, before_count - after_count)
 
@@ -323,9 +348,6 @@ def _clear_logs_action():
         }), 200
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
-    finally:
-        if conn:
-            conn.close()
 
 
 def _block_ip_action():
@@ -335,13 +357,12 @@ def _block_ip_action():
     if not ip_addr:
         return jsonify({"error": "ip_address is required"}), 400
 
-    conn = None
     try:
-        conn = get_db_connection()
-        if not conn:
+        db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+        if not db_url or not PG_AVAILABLE:
             return jsonify({"error": "Database not configured"}), 500
-        ensure_blocked_ips_table(conn)
-        conn.run(
+        ensure_blocked_ips_table()
+        run_query(
             """
             INSERT INTO blocked_ips (ip_address, reason, blocked_at)
             VALUES (:ip, :r, NOW())
@@ -353,9 +374,6 @@ def _block_ip_action():
         return jsonify({"status": "blocked", "ip_address": ip_addr}), 200
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
-    finally:
-        if conn:
-            conn.close()
 
 
 def _unblock_ip_action():
@@ -364,29 +382,24 @@ def _unblock_ip_action():
     if not ip_addr:
         return jsonify({"error": "ip_address is required"}), 400
 
-    conn = None
     try:
-        conn = get_db_connection()
-        if not conn:
+        db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+        if not db_url or not PG_AVAILABLE:
             return jsonify({"error": "Database not configured"}), 500
-        ensure_blocked_ips_table(conn)
-        conn.run("DELETE FROM blocked_ips WHERE ip_address = :ip", ip=ip_addr)
+        ensure_blocked_ips_table()
+        run_query("DELETE FROM blocked_ips WHERE ip_address = :ip", ip=ip_addr)
         return jsonify({"status": "unblocked", "ip_address": ip_addr}), 200
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
-    finally:
-        if conn:
-            conn.close()
 
 
 def _blocked_ips_list():
-    conn = None
     try:
-        conn = get_db_connection()
-        if not conn:
+        db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+        if not db_url or not PG_AVAILABLE:
             return jsonify([]), 200
-        ensure_blocked_ips_table(conn)
-        rows = conn.run("SELECT ip_address, reason, blocked_at FROM blocked_ips ORDER BY blocked_at DESC")
+        ensure_blocked_ips_table()
+        rows = run_query("SELECT ip_address, reason, blocked_at FROM blocked_ips ORDER BY blocked_at DESC")
         data = [
             {
                 "ip_address": r[0],
@@ -398,9 +411,6 @@ def _blocked_ips_list():
         return jsonify(data), 200
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
-    finally:
-        if conn:
-            conn.close()
 
 
 @app.route("/", methods=["GET", "POST", "DELETE", "OPTIONS"])
