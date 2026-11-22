@@ -67,6 +67,25 @@ def ensure_logs_table(conn):
     """)
 
 
+def ensure_blocked_ips_table(conn):
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS blocked_ips (
+            ip_address VARCHAR(100) PRIMARY KEY,
+            reason TEXT,
+            blocked_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+
+
+def get_blocked_ip_set(conn):
+    try:
+        ensure_blocked_ips_table(conn)
+        rows = conn.run("SELECT ip_address FROM blocked_ips")
+        return {str(r[0]).strip() for r in rows if r and r[0]}
+    except Exception:
+        return set()
+
+
 def detect_attack_type(endpoint_str):
     text = unquote(endpoint_str or "").lower()
     if re.search(r"(\bor\b\s*['\"]?\d+['\"]?\s*=\s*['\"]?\d+|union\s+select|drop\s+table|--|')", text):
@@ -100,6 +119,8 @@ def _track_visit():
         conn = get_db_connection()
         if conn:
             ensure_logs_table(conn)
+            blocked_set = get_blocked_ip_set(conn)
+            is_blocked = str(ip_addr).strip() in blocked_set
             conn.run(
                 """
                 INSERT INTO live_logs (ip_address, endpoint, method, attack_type, user_agent, created_at)
@@ -113,6 +134,7 @@ def _track_visit():
             )
             return jsonify({
                 "status": "recorded",
+                "blocked": is_blocked,
                 "ip_address": ip_addr,
                 "endpoint": visited_endpoint,
                 "attack_type": attack_type,
@@ -120,6 +142,7 @@ def _track_visit():
 
         return jsonify({
             "status": "db_not_configured",
+            "blocked": False,
             "ip_address": ip_addr,
             "endpoint": visited_endpoint,
             "attack_type": attack_type,
@@ -150,6 +173,7 @@ def _logs_response():
         conn = get_db_connection()
         if conn:
             ensure_logs_table(conn)
+            blocked_set = get_blocked_ip_set(conn)
             rows = conn.run("""
                 SELECT id, ip_address, endpoint, method, attack_type, created_at
                 FROM live_logs
@@ -159,14 +183,16 @@ def _logs_response():
             if rows:
                 logs = []
                 for r in rows:
+                    ip_val = (r[1] or "Unknown").strip()
                     created_val = r[5].isoformat() if hasattr(r[5], "isoformat") else str(r[5])
                     logs.append({
                         "id": r[0],
-                        "ip_address": r[1] or "Unknown",
+                        "ip_address": ip_val,
                         "endpoint": r[2] or "/",
                         "method": r[3] or "GET",
                         "attack_type": r[4] or "NORMAL_TRAFFIC",
                         "type": r[4] or "NORMAL_TRAFFIC",
+                        "blocked": ip_val in blocked_set,
                         "created_at": created_val,
                         "timestamp": created_val,
                     })
@@ -195,6 +221,7 @@ def _logs_response():
                 "ip_address": "192.168.1.45",
                 "endpoint": "/login.php?user=admin' OR '1'='1",
                 "method": "GET",
+                "blocked": False,
                 "timestamp": now_iso,
                 "created_at": now_iso,
                 "log": '192.168.1.45 - - [20/Nov/2026:10:14:22 +0000] "GET /login.php?user=admin\' OR \'1\'=\'1 HTTP/1.1" 200 1024',
@@ -205,6 +232,7 @@ def _logs_response():
                 "ip_address": "10.0.0.88",
                 "endpoint": "/download?file=../../../../etc/passwd",
                 "method": "GET",
+                "blocked": False,
                 "timestamp": now_iso,
                 "created_at": now_iso,
                 "log": '10.0.0.88 - - [20/Nov/2026:10:15:09 +0000] "GET /download?file=../../../../etc/passwd HTTP/1.1" 403 512',
@@ -215,6 +243,7 @@ def _logs_response():
                 "ip_address": "172.16.0.12",
                 "endpoint": "/api/auth",
                 "method": "POST",
+                "blocked": False,
                 "timestamp": now_iso,
                 "created_at": now_iso,
                 "log": '172.16.0.12 - - [20/Nov/2026:10:16:41 +0000] "POST /api/auth HTTP/1.1" 401 256',
@@ -225,7 +254,7 @@ def _logs_response():
         for item in attacks:
             if isinstance(item, dict):
                 raw_log = item.get("log", "")
-                ip_guess = item.get("ip_address") or (raw_log.split(" ")[0] if raw_log else "192.168.1.45")
+                ip_guess = (item.get("ip_address") or (raw_log.split(" ")[0] if raw_log else "192.168.1.45")).strip()
                 ep_guess = item.get("endpoint") or raw_log or "/"
                 t_val = item.get("attack_type") or item.get("type") or "NORMAL_TRAFFIC"
                 ts_val = item.get("timestamp") or item.get("created_at") or now_iso
@@ -236,12 +265,88 @@ def _logs_response():
                     "method": item.get("method") or "GET",
                     "attack_type": t_val,
                     "type": t_val,
+                    "blocked": bool(item.get("blocked", False)),
                     "timestamp": ts_val,
                     "created_at": ts_val,
                 })
         attacks = normalized
 
     return jsonify(attacks), 200
+
+
+def _block_ip_action():
+    payload = request.get_json(silent=True) or {}
+    ip_addr = (payload.get("ip_address") or request.args.get("ip") or "").strip()
+    reason = (payload.get("reason") or "Blocked via UniShield LiveLogs").strip()
+    if not ip_addr:
+        return jsonify({"error": "ip_address is required"}), 400
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"error": "Database not configured"}), 500
+        ensure_blocked_ips_table(conn)
+        conn.run(
+            """
+            INSERT INTO blocked_ips (ip_address, reason, blocked_at)
+            VALUES (:ip, :r, NOW())
+            ON CONFLICT (ip_address) DO UPDATE SET reason = :r, blocked_at = NOW()
+            """,
+            ip=ip_addr,
+            r=reason,
+        )
+        return jsonify({"status": "blocked", "ip_address": ip_addr}), 200
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+def _unblock_ip_action():
+    payload = request.get_json(silent=True) or {}
+    ip_addr = (payload.get("ip_address") or request.args.get("ip") or "").strip()
+    if not ip_addr:
+        return jsonify({"error": "ip_address is required"}), 400
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"error": "Database not configured"}), 500
+        ensure_blocked_ips_table(conn)
+        conn.run("DELETE FROM blocked_ips WHERE ip_address = :ip", ip=ip_addr)
+        return jsonify({"status": "unblocked", "ip_address": ip_addr}), 200
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+def _blocked_ips_list():
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify([]), 200
+        ensure_blocked_ips_table(conn)
+        rows = conn.run("SELECT ip_address, reason, blocked_at FROM blocked_ips ORDER BY blocked_at DESC")
+        data = [
+            {
+                "ip_address": r[0],
+                "reason": r[1] or "",
+                "blocked_at": r[2].isoformat() if hasattr(r[2], "isoformat") else str(r[2]),
+            }
+            for r in rows
+        ]
+        return jsonify(data), 200
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.route("/", methods=["GET", "POST", "OPTIONS"])
@@ -255,6 +360,12 @@ def health_check():
         return _logs_response()
     if endpoint == "vulnerabilities":
         return _vulnerabilities_response()
+    if endpoint == "block_ip":
+        return _block_ip_action()
+    if endpoint == "unblock_ip":
+        return _unblock_ip_action()
+    if endpoint == "blocked_ips":
+        return _blocked_ips_list()
     return jsonify({
         "status": "ok" if ETL_IMPORT_ERROR is None else "degraded",
         "service": "UniShield Backend",
@@ -277,6 +388,21 @@ def get_vulnerabilities():
 @app.route("/api/logs", methods=["GET"])
 def get_logs():
     return _logs_response()
+
+
+@app.route("/api/block-ip", methods=["POST"])
+def api_block_ip():
+    return _block_ip_action()
+
+
+@app.route("/api/unblock-ip", methods=["POST"])
+def api_unblock_ip():
+    return _unblock_ip_action()
+
+
+@app.route("/api/blocked-ips", methods=["GET"])
+def api_blocked_ips():
+    return _blocked_ips_list()
 
 
 class VercelPathFixMiddleware:
