@@ -58,6 +58,13 @@ def ensure_logs_table(conn):
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
+    conn.run("""
+        ALTER TABLE live_logs
+        ADD COLUMN IF NOT EXISTS user_agent TEXT,
+        ADD COLUMN IF NOT EXISTS method VARCHAR(20),
+        ADD COLUMN IF NOT EXISTS attack_type VARCHAR(50),
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
+    """)
 
 
 def detect_attack_type(endpoint_str):
